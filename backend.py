@@ -202,28 +202,38 @@ def is_local_admin_request(request: Request) -> bool:
         return False
 
 
+
 def admin_session(request: Request) -> bool:
-    if not is_local_admin_request(request):
-        return False
     token = request.cookies.get("portfolio_admin_session")
     if not token:
         return False
+
     token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+
     with sqlite3.connect(DATABASE_PATH, timeout=5) as connection:
         row = connection.execute(
-            "SELECT expires_at FROM admin_sessions WHERE token_hash = ?", (token_hash,)
+            "SELECT expires_at FROM admin_sessions WHERE token_hash = ?",
+            (token_hash,)
         ).fetchone()
+
     if not row:
         return False
+
     try:
-        if datetime.fromisoformat(row[0]) <= datetime.now(timezone.utc):
+        expires_at = datetime.fromisoformat(row[0])
+        if expires_at <= datetime.now(timezone.utc):
             with sqlite3.connect(DATABASE_PATH, timeout=5) as connection:
-                connection.execute("DELETE FROM admin_sessions WHERE token_hash = ?", (token_hash,))
+                connection.execute(
+                    "DELETE FROM admin_sessions WHERE token_hash = ?",
+                    (token_hash,)
+                )
                 connection.commit()
             return False
     except ValueError:
         return False
+
     return True
+
 
 
 def require_admin(request: Request) -> None:
@@ -287,74 +297,83 @@ def get_portfolio() -> dict:
     return PORTFOLIO
 
 
+
 @app.get("/api/admin/session")
 def get_admin_session(request: Request) -> dict[str, bool]:
-    with sqlite3.connect(DATABASE_PATH, timeout=5) as connection:
-        configured = connection.execute("SELECT 1 FROM admin_credentials WHERE id = 1").fetchone() is not None
-    return {"authenticated": admin_session(request), "configured": configured}
+    configured = bool(
+        os.getenv("ADMIN_USERNAME", "").strip()
+        and os.getenv("ADMIN_PASSWORD", "")
+    )
+
+    return {
+        "authenticated": admin_session(request),
+        "configured": configured
+    }
+
 
 
 @app.post("/api/admin/login")
 def login_admin(payload: AdminLogin, request: Request, response: Response) -> dict[str, str | bool]:
-    if not is_local_admin_request(request):
-        raise HTTPException(status_code=403, detail="Admin sign-in is available only from this computer.")
-    with sqlite3.connect(DATABASE_PATH, timeout=5) as connection:
-        row = connection.execute(
-            "SELECT username, salt, password_hash FROM admin_credentials WHERE id = 1"
-        ).fetchone()
+    admin_username = os.getenv("ADMIN_USERNAME", "").strip()
+    admin_password = os.getenv("ADMIN_PASSWORD", "")
 
-    salt = row[1] if row else b"portfolio-admin-dummy-salt"
-    candidate = hash_admin_password(payload.password, salt)
-    valid = bool(
-        row
-        and hmac.compare_digest(payload.username.strip().casefold(), row[0].casefold())
-        and hmac.compare_digest(candidate, row[2])
+    if not admin_username or not admin_password:
+        raise HTTPException(
+            status_code=503,
+            detail="Admin credentials are not configured on the server."
+        )
+
+    username_valid = hmac.compare_digest(
+        payload.username.strip().encode("utf-8"),
+        admin_username.encode("utf-8")
     )
-    if not valid:
-        raise HTTPException(status_code=401, detail="Username or password is incorrect.")
+    password_valid = hmac.compare_digest(
+        payload.password.encode("utf-8"),
+        admin_password.encode("utf-8")
+    )
+
+    if not (username_valid and password_valid):
+        raise HTTPException(
+            status_code=401,
+            detail="Username or password is incorrect."
+        )
 
     token = secrets.token_urlsafe(32)
     token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
-    expires_at = (datetime.now(timezone.utc) + timedelta(hours=12)).isoformat(timespec="seconds")
+    expires_at = (
+        datetime.now(timezone.utc) + timedelta(hours=12)
+    ).isoformat(timespec="seconds")
+
     with sqlite3.connect(DATABASE_PATH, timeout=5) as connection:
-        connection.execute("DELETE FROM admin_sessions WHERE expires_at <= ?", (datetime.now(timezone.utc).isoformat(timespec="seconds"),))
-        connection.execute("INSERT INTO admin_sessions (token_hash, expires_at) VALUES (?, ?)", (token_hash, expires_at))
+        connection.execute(
+            "DELETE FROM admin_sessions WHERE expires_at <= ?",
+            (datetime.now(timezone.utc).isoformat(timespec="seconds"),)
+        )
+        connection.execute(
+            "INSERT INTO admin_sessions (token_hash, expires_at) VALUES (?, ?)",
+            (token_hash, expires_at)
+        )
         connection.commit()
+
     response.set_cookie(
         key="portfolio_admin_session",
         value=token,
         max_age=12 * 60 * 60,
         httponly=True,
-        secure=request.url.scheme == "https",
+        secure=True,
         samesite="strict",
         path="/api/admin",
     )
-    return {"ok": True, "username": row[0]}
+
+    return {"ok": True, "username": admin_username}
+
 
 
 @app.post("/api/admin/setup")
 def setup_admin(payload: AdminLogin, request: Request, response: Response) -> dict[str, str | bool]:
-    if not is_local_admin_request(request):
-        raise HTTPException(status_code=403, detail="Admin setup is available only from this computer.")
-    username = payload.username.strip()
-    if not username:
-        raise HTTPException(status_code=422, detail="Choose a username.")
-    if len(payload.password) < 12:
-        raise HTTPException(status_code=422, detail="Use a password with at least 12 characters.")
-
-    salt = secrets.token_bytes(16)
-    password_hash = hash_admin_password(payload.password, salt)
-    with sqlite3.connect(DATABASE_PATH, timeout=5) as connection:
-        connection.execute("BEGIN IMMEDIATE")
-        existing = connection.execute("SELECT 1 FROM admin_credentials WHERE id = 1").fetchone()
-        if existing:
-            raise HTTPException(status_code=409, detail="An admin account already exists. Sign in instead.")
-        connection.execute(
-            "INSERT INTO admin_credentials (id, username, salt, password_hash) VALUES (1, ?, ?, ?)",
-            (username, salt, password_hash),
-        )
-        connection.commit()
-    return login_admin(AdminLogin(username=username, password=payload.password), request, response)
+    # Admin credentials are configured through Render environment variables.
+    # The setup endpoint now uses the same secure authentication as login.
+    return login_admin(payload, request, response)
 
 
 @app.post("/api/admin/logout")
