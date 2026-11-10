@@ -1,0 +1,8 @@
+{
+  "rewrites": [
+    {
+      "source": "/api/:path*",
+      "destination": "https://ismail-portfolio-api-6rsp.onrender.com/api/:path*"
+    }
+  ]
+}
